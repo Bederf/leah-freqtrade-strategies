@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "max_open_trades": 3,
+  "stake_currency": "USDT",
+  "stake_amount": 50,
+  "tradable_balance_ratio": 0.99,
+  "fiat_display_currency": "USD",
+  "timeframe": "5m",
+  "dry_run": true,
+  "dry_run_wallet": 1000,
+  "cancel_open_orders_on_exit": false,
+  "unfilledtimeout": {
+    "entry": 10,
+    "exit": 10,
+    "unit": "minutes"
+  },
+  "entry_pricing": {
+    "price_side": "same",
+    "use_order_book": false
+  },
+  "exit_pricing": {
+    "price_side": "same",
+    "use_order_book": false
+  },
+  "exchange": {
+    "name": "binance",
+    "key": "YOUR_BINANCE_API_KEY",
+    "secret": "YOUR_BINANCE_API_SECRET",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": [
+      "BTC/USDT",
+      "ETH/USDT",
+      "SOL/USDT",
+      "LINK/USDT"
+    ],
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "freqai": {
+    "enabled": true,
+    "purge_old_models": 2,
+    "train_period_days": 30,
+    "backtest_period_days": 7,
+    "live_retrain_hours": 24,
+    "identifier": "leah_v4_4",
+    "feature_parameters": {
+      "include_timeframes": ["5m", "15m", "1h"],
+      "include_corr_pairlist": ["BTC/USDT"],
+      "label_period_candles": 20,
+      "include_shifted_candles": 2,
+      "DI_threshold": 0.9,
+      "weight_factor": 0.9,
+      "principal_component_analysis": false,
+      "use_SVM_to_remove_outliers": true,
+      "indicator_periods_candles": [10, 20]
+    },
+    "data_split_parameters": {
+      "test_size": 0.25,
+      "random_state": 42
+    },
+    "model_training_parameters": {
+      "n_estimators": 200,
+      "max_depth": 5,
+      "learning_rate": 0.05
+    }
+  },
+  "bot_name": "LeahAI_FreqAI",
+  "initial_state": "running",
+  "force_entry_enable": true,
+  "internals": {
+    "process_throttle_secs": 5
+  }
+}
