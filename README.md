@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Bederf/leah-freqtrade-strategies/pulls)
 
-Production-grade, quantitatively audited strategies for [Freqtrade](https://www.freqtrade.io/).
+Research and backtesting strategies for [Freqtrade](https://www.freqtrade.io/).
 
 Unlike traditional retail indicators (RSI/MACD crossovers or martingale grid bots) which suffer from severe regime decay and drawdown risk, these strategies are built on **evidence-first quantitative mechanics**:
 * **Macro Regime Gating:** Automatic left-tail risk truncation when Bitcoin breaks below its macro trend.
@@ -63,6 +63,13 @@ Unlike traditional retail indicators (RSI/MACD crossovers or martingale grid bot
 * **Feature Pipeline:** 15 stable features across momentum, return ratios, and candle morphology, validated across out-of-sample splits.
 
 ---
+
+## Project status and risk boundary
+
+**Maturity: research repository with reproducible strategy code and example
+configs.** The reported results are historical backtests, not a promise of
+future performance. Validate data quality, fees, slippage, exchange rules and
+market regime before any use. This repository is not financial advice.
 
 ## Quickstart Guide
 
