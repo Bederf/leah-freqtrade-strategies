@@ -1,5 +1,10 @@
 # Leah Freqtrade Strategies
 
+[![Freqtrade Compatibility](https://img.shields.io/badge/Freqtrade-2024.x%2B-blue.svg)](https://www.freqtrade.io/)
+[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/Bederf/leah-freqtrade-strategies/pulls)
+
 Production-grade, quantitatively audited strategies for [Freqtrade](https://www.freqtrade.io/).
 
 Unlike traditional retail indicators (RSI/MACD crossovers or martingale grid bots) which suffer from severe regime decay and drawdown risk, these strategies are built on **evidence-first quantitative mechanics**:
@@ -66,7 +71,7 @@ Unlike traditional retail indicators (RSI/MACD crossovers or martingale grid bot
 Clone this repository directly into your Freqtrade installation:
 
 ```bash
-git clone https://github.com/your-username/leah-freqtrade-strategies.git
+git clone https://github.com/Bederf/leah-freqtrade-strategies.git
 cp -r leah-freqtrade-strategies/strategies/* user_data/strategies/
 ```
 
