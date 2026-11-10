@@ -66,6 +66,7 @@ REBALANCE_DOW = 4  # Friday
 # degrades to today's behaviour, never to a wrong rank. Reading is mtime-cached,
 # so the file is parsed once per boundary rather than once per pair.
 import os as _os
+import time as _time
 from pathlib import Path as _Path
 
 _RANK_SNAPSHOT_PATH = _Path(__file__).resolve().parent.parent / "data/rank_snapshot.json"
@@ -111,6 +112,19 @@ HIGH_IMPACT_DATES = {
 # (4% would tag 44% of weeks — sub-sigma, rejected. Measured 2026-08-29.)
 SHOCK_THRESHOLD = 0.06
 
+# ── Rank fetch retry (added 2026-11-10) ─────────────────────────────────────────
+# Binance does not publish a final 1d candle at the 00:00:00Z close. The in-loop fallback used
+# to fetch ONCE and surrender, so the completeness guard withheld the rank on 8 of 9 nights
+# (Nov 2-10) — the strategy looked healthy while never qualifying an entry. The sidecar, which
+# fetches five minutes later, got 8/8 complete every one of those nights.
+#
+# So: poll until the universe is complete, instead of treating the first partial read as final.
+# The ranks themselves are UNCHANGED once the data arrives; only the moment of the fetch moves.
+# The window below is sized to span the sidecar's proven 5-minute lag. Applied once per candle
+# close, not once per pair (see _rank_cache), and never during backtesting.
+RANK_FETCH_ATTEMPTS = 7
+RANK_FETCH_DELAY_S = 45.0
+
 
 class LeahClock4(IStrategy):
     INTERFACE_VERSION = 3
@@ -134,8 +148,15 @@ class LeahClock4(IStrategy):
     startup_candle_count = MOM_DAYS + 5
 
     def informative_pairs(self):
-        # BTC only — other whitelist pairs are fetched via get_pair_dataframe
-        return [("BTC/USDT", self.timeframe)]
+        # BTC only for the regime gate — other whitelist pairs are fetched via get_pair_dataframe.
+        # The v4.4 models, however, were TRAINED ON 5-MINUTE BARS (46,034 samples over 159.8
+        # days = exactly 288 bars/day), so their features must be computed on a 5m series.
+        # Declaring them here makes freqtrade download and refresh that 5m data.
+        pairs = [("BTC/USDT", self.timeframe)]
+        if getattr(self, "_v44_enabled", False):
+            for _p in ("BTC/USDT", "ETH/USDT", "SOL/USDT", "LINK/USDT"):
+                pairs.append((_p, "5m"))
+        return pairs
 
     # ── v4.4 shadow helpers (additive; never touches gate/rank/entry/exit) ──
     def __init__(self, config: dict) -> None:
@@ -144,6 +165,8 @@ class LeahClock4(IStrategy):
         self._v44_cache: dict = {}
         self._v44_warned: set = set()
         self._v44_last_log: dict = {}
+        self._v44_5m_cache: dict = {}
+        self._v44_5m_warned: set = set()
         if self._v44_enabled:
             logger.warning("force_v44_model=true — v4.4 shadow observation ENABLED (LeahClock4 v4.4 port)")
 
@@ -234,7 +257,103 @@ class LeahClock4(IStrategy):
                     f"(expected: only BTC/ETH/SOL/LINK have models)"
                 )
             return None
-        return model.predict_proba(scaler.transform(self._v44_feature_matrix(dataframe, feats)))[:, 1]
+        # 5m source of truth — see _v44_probs_from_5m for why 1d is wrong for these models.
+        return self._v44_probs_from_5m(pair, dataframe, model, scaler, feats)
+
+    def _v44_probs_from_5m(self, pair: str, dataframe: DataFrame, model, scaler, feats):
+        """v4.4 probabilities for each DAILY candle, computed from the 5m series.
+
+        The models were trained on 5-minute bars (46,034 samples / 159.8 days = 288 bars/day)
+        and carry a MinMaxScaler fitted to 5m feature ranges. Feeding them a 1d dataframe puts
+        roughly 38% of feature rows outside that fitted range — vol_ma20 and %atr14_rel sit
+        entirely outside it — and the scaler clips, so every probability compresses to about
+        half its trained level. Measured before this fix: ETH mean 0.1546 against a trained
+        0.3235. Computing on 5m and carrying the values onto the daily candles reproduces the
+        trained distribution exactly (delta 0.0000 on all three models).
+
+        Returns None when the 5m series is missing or too short — the caller then withholds
+        the prediction rather than silently falling back to the wrong resolution.
+        """
+        import numpy as np
+
+        try:
+            d5 = self.dp.get_pair_dataframe(pair=pair, timeframe="5m")
+        except Exception as exc:
+            d5 = None
+            logger.warning(f"[CLOCK4-V44][{pair}] 5m informative fetch failed: "
+                           f"{exc.__class__.__name__}: {exc}")
+
+        # The DataProvider only carries a short recent window of informative candles once a
+        # strategy restarts (observed live: 4 daily-equivalent rows), which is far too thin for
+        # the distribution statistic the shadow run exists to produce. Layer the on-disk 5m
+        # history underneath the live rows: history from the cache, freshest bars from the API.
+        #
+        # feather returns tz-NAIVE timestamps while the DataProvider returns tz-aware UTC, and
+        # concatenating the two yields a mixed-dtype column that merge_asof rejects outright
+        # ("incompatible merge keys"). Normalise every series to UTC-aware before they meet.
+        def _utc(s):
+            s = pd.to_datetime(s)
+            return s.dt.tz_localize("UTC") if s.dt.tz is None else s.dt.tz_convert("UTC")
+
+        if d5 is not None and len(d5):
+            d5 = d5.copy()
+            d5["date"] = _utc(d5["date"])
+        try:
+            from pathlib import Path as _P
+            _dd = _P((getattr(self, "config", {}) or {}).get("datadir")
+                     or "user_data/data/binance")
+            _f = _dd / f"{pair.replace('/', '_')}-5m.feather"
+            if _f.exists():
+                _hist = pd.read_feather(_f)
+                _hist["date"] = _utc(_hist["date"])
+                if d5 is not None and len(d5):
+                    d5 = (pd.concat([_hist, d5], ignore_index=True)
+                          .drop_duplicates(subset=["date"], keep="last")
+                          .sort_values("date").reset_index(drop=True))
+                else:
+                    d5 = _hist
+        except Exception as exc:
+            logger.warning(f"[CLOCK4-V44][{pair}] 5m history load skipped: "
+                           f"{exc.__class__.__name__}: {exc}")
+
+        if d5 is None or len(d5) < 100:
+            if pair not in self._v44_5m_warned:
+                self._v44_5m_warned.add(pair)
+                logger.warning(
+                    f"[CLOCK4-V44][{pair}] 5m informative data unavailable "
+                    f"({0 if d5 is None else len(d5)} bars) — v4.4 prediction WITHHELD "
+                    f"(1d features are out of population for these models)"
+                )
+            return None
+
+        # Cache on (pair, last 5m bar, daily length): the feature matrix costs a few seconds
+        # over ~80k bars, and the 5m series only advances every 5 minutes.
+        key = (pair, str(d5["date"].iloc[-1]), len(dataframe))
+        if key in self._v44_5m_cache:
+            return self._v44_5m_cache[key]
+
+        p5 = model.predict_proba(scaler.transform(self._v44_feature_matrix(d5, feats)))[:, 1]
+
+        bars = pd.DataFrame({
+            "bar_time": d5["date"].values,
+            "close_time": d5["date"].add(pd.Timedelta(minutes=5)).values,
+            "prob": p5,
+        }).sort_values("close_time")
+        _ddate = _utc(dataframe["date"])
+        daily = pd.DataFrame({
+            "date": _ddate.values,
+            "window_end": _ddate.add(pd.Timedelta(days=1)).values,
+        }).sort_values("window_end")
+        merged = pd.merge_asof(daily, bars, left_on="window_end", right_on="close_time",
+                               direction="backward", tolerance=pd.Timedelta(days=1))
+        merged = merged.sort_values("date")
+        probs = merged["prob"].to_numpy(dtype=float)
+        if len(probs) != len(dataframe):
+            return None
+        self._v44_5m_cache[key] = probs
+        for stale in [k for k in self._v44_5m_cache if k[0] == pair and k != key]:
+            self._v44_5m_cache.pop(stale, None)
+        return probs
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # Own-pair 30d momentum, T-1 lag: close[thu]/close[thu-30] computed on
@@ -374,10 +493,13 @@ class LeahClock4(IStrategy):
                     # shadow window (SOL landed at 0.3%, below the 1% floor — see E022).
                     _w = probs[-30:] if len(probs) >= 30 else probs
                     w55 = int((_w >= 0.55).sum())
+                    # nan-aware: daily candles predating the 5m series carry no prediction.
+                    _v = probs[~pd.isna(probs)]
                     logger.info(
-                        f"[CLOCK4-V44][{metadata['pair']}] v4.4 override — prob mean={probs.mean():.4f}, "
-                        f"std={probs.std():.4f}, %>55={n55}/{len(probs)}, "
-                        f"%>55_30={w55}/{len(_w)}, last={probs[-1]:.4f}"
+                        f"[CLOCK4-V44][{metadata['pair']}] v4.4 override (5m features) — "
+                        f"prob mean={_v.mean():.4f}, "
+                        f"std={_v.std():.4f}, %>55={n55}/{len(_v)}, "
+                        f"%>55_30={w55}/{len(_w)}, last={_v[-1]:.4f}"
                     )
         return dataframe
 
@@ -414,21 +536,76 @@ class LeahClock4(IStrategy):
         )
         return True
 
+    # One cross-section per candle close, shared by every pair in the cycle. Without this the
+    # retry below would sleep once per pair — eight times over — instead of once per candle.
+    _rank_cache: dict = {}
+
+    @staticmethod
+    def _is_live_run(dp) -> bool:
+        """True only in live/dry-run. A backtest must never sleep on a retry."""
+        try:
+            return str(dp.runmode.value) in ("live", "dry_run")
+        except Exception:
+            return False
+
+    def _collect_rank_inputs(self, whitelist: list, dataframe: DataFrame,
+                             metadata: dict) -> dict:
+        """Fetch every pair's 30d momentum series, polling until the universe is complete.
+
+        Binance does not publish a final 1d candle at the 00:00:00Z close. Fetching once there saw
+        4-6 of 8 pairs and withheld the rank on 8 of 9 nights (Nov 2-10), while the sidecar —
+        fetching at 00:05 — saw 8/8 every night. This waits for the data instead of concluding it
+        is absent.
+
+        Returns the same {pair: mom_series} shape as before, so the ranking and the completeness
+        guard downstream are byte-for-byte unchanged. A pair that genuinely has no data still ends
+        as a withhold.
+        """
+        key = (self.timeframe, str(dataframe["date"].iloc[-1]) if len(dataframe) else "?")
+        cached = self._rank_cache.get(key)
+        if cached is not None:
+            return cached
+
+        attempts = RANK_FETCH_ATTEMPTS if self._is_live_run(self.dp) else 1
+        mom_series: dict = {}
+        for attempt in range(1, attempts + 1):
+            mom_series = {}
+            for pair in whitelist:
+                other = self.dp.get_pair_dataframe(pair, self.timeframe)
+                if other.empty:
+                    continue
+                o = other[["date", "close"]].copy()
+                o["mom_p"] = o["close"].shift(1) / o["close"].shift(MOM_DAYS + 1) - 1
+                o = o.dropna(subset=["mom_p"])
+                if o.empty:
+                    continue
+                mom_series[pair] = o.set_index("date")["mom_p"]
+
+            missing = [p for p in whitelist if p not in mom_series]
+            if not missing:
+                if attempt > 1:
+                    logger.warning(
+                        "[CLOCK4][%s] rank universe completed on attempt %d/%d after %.0fs "
+                        "— full cross-section of %d pairs",
+                        metadata["pair"], attempt, attempts,
+                        (attempt - 1) * RANK_FETCH_DELAY_S, len(whitelist))
+                break
+            if attempt < attempts:
+                logger.warning(
+                    "[CLOCK4][%s] rank fetch %d/%d incomplete — %d of %d pairs, missing %s; "
+                    "waiting %.0fs for the candle to settle",
+                    metadata["pair"], attempt, attempts, len(mom_series), len(whitelist),
+                    ",".join(sorted(missing)), RANK_FETCH_DELAY_S)
+                _time.sleep(RANK_FETCH_DELAY_S)
+
+        self._rank_cache = {key: mom_series}
+        return mom_series
+
     def _rank_inloop(self, dataframe: DataFrame, metadata: dict) -> None:
         """In-loop cross-sectional rank — unchanged fallback behaviour (E024 semantics)."""
         whitelist = [p for p in self.config.get("exchange", {}).get("pair_whitelist", [])
                      if p != "BTC/USDT"]
-        mom_series = {}
-        for pair in whitelist:
-            other = self.dp.get_pair_dataframe(pair, self.timeframe)
-            if other.empty:
-                continue
-            o = other[["date", "close"]].copy()
-            o["mom_p"] = o["close"].shift(1) / o["close"].shift(MOM_DAYS + 1) - 1
-            o = o.dropna(subset=["mom_p"])
-            if o.empty:
-                continue
-            mom_series[pair] = o.set_index("date")["mom_p"]
+        mom_series = self._collect_rank_inputs(whitelist, dataframe, metadata)
 
         if mom_series:
             shared = pd.DataFrame(mom_series)          # one frame, one date index
